@@ -1,0 +1,9 @@
+# Ignorér alle undermapper
+*/
+
+# Tillad alle filer i roden (med og uden punktum)
+!*.*
+!.*
+
+# Ekstra: Hvis du har en README uden filendelse, kan du tillade den sådan her:
+!README
