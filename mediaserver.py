@@ -23,9 +23,9 @@ import ssl
 import os
 import subprocess
 import logging
+import json # Nyt import for JSON-parsing
 
 # Required libraries for aiohttp web server and websockets
-# *** VIGTIGT: Flyttet tilbage til toppen ***
 from aiohttp import web, ClientSession 
 
 # --- Logging Setup ---
@@ -37,6 +37,7 @@ logger = logging.getLogger(__name__)
 latest_video_chunk = None
 new_chunk_event = asyncio.Event() 
 ffmpeg_process = None
+client_video_mime_type = None # Global variabel til at gemme klientens MIME type
 
 # Placeholder video path (optional, but good for robust startup)
 PLACEHOLDER_WEBM_PATH = 'placeholder.webm'
@@ -80,11 +81,28 @@ def get_local_ip():
 # --- FFmpeg Management ---
 async def start_ffmpeg_process(output_url):
     """
-    Starts an FFmpeg subprocess to transcode WebM input (from stdin)
+    Starts an FFmpeg subprocess to transcode input (from stdin)
     to H.264 in an RTSP/RTMP stream.
+    The input format is determined by `client_video_mime_type`.
     """
     global ffmpeg_process
-    
+
+    # Determine FFmpeg input format based on client's MIME type
+    ffmpeg_input_format = None
+    # 'video/mp4;codecs=avc1' -> 'mp4'
+    # 'video/webm;codecs=vp8' -> 'webm'
+    if client_video_mime_type:
+        if 'mp4' in client_video_mime_type:
+            ffmpeg_input_format = 'mp4'
+        elif 'webm' in client_video_mime_type:
+            ffmpeg_input_format = 'webm'
+        else:
+            logger.error(f"❌ Ukendt eller ikke-understøttet klient MIME type: {client_video_mime_type}. Kan ikke starte FFmpeg.")
+            return # Kan ikke starte FFmpeg uden at kende inputformatet
+    else:
+        logger.error("❌ client_video_mime_type er ikke indstillet. Kan ikke starte FFmpeg.")
+        return # Kan ikke starte FFmpeg uden at kende inputformatet
+
     # Check if ffmpeg executable is available
     if not subprocess.run(['which', 'ffmpeg'], capture_output=True).returncode == 0:
         logger.error("❌ FFmpeg executable not found in system PATH!")
@@ -99,13 +117,14 @@ async def start_ffmpeg_process(output_url):
     ffmpeg_cmd = [
         'ffmpeg',
         '-loglevel', 'warning', # Reduce FFmpeg output verbosity
-        '-i', 'pipe:0',        # Read input from stdin
+        '-f', ffmpeg_input_format, # Explicitly specify input format
+        '-i', 'pipe:0',          # Read input from stdin
         '-c:v', 'libx264',
         '-preset', 'veryfast',
         '-tune', 'zerolatency',
-        '-b:v', '2M',          # Adjust bitrate as needed (e.g., '1M', '3M')
-        '-g', '30',            # Keyframe interval (important for stream recovery)
-        '-f', 'rtsp',          # Output as RTSP stream
+        '-b:v', '2M',            # Adjust bitrate as needed (e.g., '1M', '3M')
+        '-g', '30',              # Keyframe interval (important for stream recovery)
+        '-f', 'rtsp',            # Output as RTSP stream
         '-rtsp_transport', 'tcp', # Ensure TCP transport for RTSP
         output_url
     ]
@@ -161,59 +180,89 @@ async def stop_ffmpeg_process():
 async def websocket_handler(request):
     """
     Handles incoming WebSocket connections from the camera (PWA).
-    Receives WebM video chunks and feeds them to the FFmpeg process's stdin.
+    Receives WebM/MP4 video chunks and feeds them to the FFmpeg process's stdin.
     """
     global latest_video_chunk 
     global new_chunk_event
     global ffmpeg_process
+    global client_video_mime_type # Brug denne globale variabel
 
     ws = web.WebSocketResponse()
     await ws.prepare(request)
     logger.info("📡 Camera (PWA) connected via WebSocket")
 
-    # Ensure FFmpeg is running when the first client connects
+    # --- Trin 1: Modtag den indledende MIME type besked fra klienten ---
+    # Denne loop er specifikt for den første besked, som skal være JSON
+    async for msg in ws:
+        if msg.type == web.WSMsgType.TEXT:
+            try:
+                data = json.loads(msg.data)
+                if data.get("type") == "init" and data.get("mimeType"):
+                    client_video_mime_type = data["mimeType"]
+                    logger.info(f"Received client MIME type: {client_video_mime_type}")
+                    break # Afslut denne loop, vi fik init beskeden
+            except json.JSONDecodeError:
+                logger.warning(f"Received non-JSON text message: {msg.data}. Expected init message.")
+                await ws.close(code=1003) # FJERNET 'reason' argument
+                return ws
+        else:
+            logger.warning(f"Received non-text initial message type: {msg.type}. Expected JSON MIME type.")
+            await ws.close(code=1003) # FJERNET 'reason' argument
+            return ws
+
+    if not client_video_mime_type:
+        logger.error("Klient sendte ikke forventet MIME type. Lukker forbindelse.")
+        await ws.close(code=1003) # FJERNET 'reason' argument
+        return ws
+
+    # Sørg for, at FFmpeg kører, når den første klient forbinder OG vi har mime-typen
+    # Vi starter FFmpeg her, da vi nu har inputformatet
     if not ffmpeg_process or ffmpeg_process.returncode is not None:
-        await start_ffmpeg_process(RTSP_OUTPUT_URL) # Use the configured output URL
+        await start_ffmpeg_process(RTSP_OUTPUT_URL) # Brug den konfigurerede output URL
 
     if not ffmpeg_process:
-        logger.error("FFmpeg process is not running. Cannot receive video data.")
-        await ws.close(code=1011, message="FFmpeg backend not available.")
+        logger.error("FFmpeg processen kører ikke. Kan ikke modtage video data.")
+        await ws.close(code=1011) # FJERNET 'reason' argument
         return ws
 
     try:
-        async for msg in ws:
+        async for msg in ws: # Denne loop behandler efterfølgende binære video-chunks
             if msg.type == web.WSMsgType.BINARY:
                 video_chunk = msg.data
-                # Feed the WebM chunk directly to FFmpeg's stdin
+                # Før WebM/MP4 chunken direkte til FFmpeg's stdin
                 if ffmpeg_process and ffmpeg_process.stdin and not ffmpeg_process.stdin.is_closing():
                     try:
                         ffmpeg_process.stdin.write(video_chunk)
-                        await ffmpeg_process.stdin.drain() # Ensure data is written
-                        new_chunk_event.set() 
+                        await ffmpeg_process.stdin.drain() # Sørg for, at data er skrevet
+                        new_chunk_event.set()
                     except BrokenPipeError:
-                        logger.error("FFmpeg stdin pipe is broken. FFmpeg likely crashed or exited.")
-                        await ws.close(code=1011, message="FFmpeg pipe broken.")
+                        logger.error("FFmpeg stdin pipe er brudt. FFmpeg er sandsynligvis styrtet ned eller afsluttet.")
+                        await ws.close(code=1011) # FJERNET 'reason' argument
                         break
                     except Exception as e:
-                        logger.error(f"Error writing to FFmpeg stdin: {e}")
-                        await ws.close(code=1011, message="Server error during video processing.")
+                        logger.error(f"Fejl ved skrivning til FFmpeg stdin: {e}")
+                        await ws.close(code=1011) # FJERNET 'reason' argument
                         break
                 else:
-                    logger.warning("Received video chunk but FFmpeg stdin not available or is closing. Dropping frame.")
-                    # Optionally buffer or drop frames if FFmpeg isn't ready
-                    latest_video_chunk = video_chunk # Keep the latest in case FFmpeg starts soon
+                    logger.warning("Modtog video chunk, men FFmpeg stdin er ikke tilgængelig eller lukker. Dropper frame.")
+                    # Valgfrit: buffer eller drop frames, hvis FFmpeg ikke er klar
+                    latest_video_chunk = video_chunk # Behold den seneste i tilfælde af at FFmpeg starter snart
             elif msg.type == web.WSMsgType.ERROR:
-                logger.error(f"WS connection closed with exception: {ws.exception()}")
+                logger.error(f"WS forbindelse lukket med undtagelse: {ws.exception()}")
             elif msg.type == web.WSMsgType.CLOSE:
-                logger.info("WS connection closed by client.")
-                break # Exit loop if client closes connection gracefully
+                logger.info("WS forbindelse lukket af klient.")
+                break # Afslut loop, hvis klienten lukker forbindelse elegant
+            elif msg.type == web.WSMsgType.TEXT: # Håndter uventede tekstbeskeder efter init
+                logger.warning(f"Modtog uventet tekstbesked efter init: {msg.data}")
 
     except asyncio.CancelledError:
-        logger.info("WebSocket handler task cancelled.")
+        logger.info("WebSocket handler task annulleret.")
     except Exception as e:
-        logger.error(f"Unexpected error in WebSocket handler: {e}")
+        logger.error(f"Uventet fejl i WebSocket handler: {e}")
     finally:
         logger.info("🔌 Camera (PWA) disconnected")
+        # Stop IKKE FFmpeg her, da andre klienter måske vil forbinde.
+        # FFmpeg skal kun stoppe, når serveren lukker ned.
         await ws.close()
     return ws
 
@@ -232,18 +281,18 @@ async def main():
     """
     # --- Parameter Validation ---
     if len(sys.argv) != 3:
-        logger.error("❌ Invalid number of arguments.")
-        logger.error("Usage: python3 mediaserver.py <PWA_WebSocket_Port> <HTTP_Placeholder_Port>")
-        logger.error("Example: python3 mediaserver.py 8181 8080")
+        logger.error("❌ Ugyldigt antal argumenter.")
+        logger.error("Anvendelse: python3 mediaserver.py <PWA_WebSocket_Port> <HTTP_Placeholder_Port>")
+        logger.error("Eksempel: python3 mediaserver.py 8181 8080")
         sys.exit(1)
 
     try:
         ws_port = int(sys.argv[1])
         http_port = int(sys.argv[2]) # HTTP port for potential future uses, or just a placeholder
     except ValueError:
-        logger.error("❌ Port numbers must be integers.")
-        logger.error("Usage: python3 mediaserver.py <PWA_WebSocket_Port> <HTTP_Placeholder_Port>")
-        logger.error("Example: python3 mediaserver.py 8181 8080")
+        logger.error("❌ Portnumre skal være heltal.")
+        logger.error("Anvendelse: python3 mediaserver.py <PWA_WebSocket_Port> <HTTP_Placeholder_Port>")
+        logger.error("Eksempel: python3 mediaserver.py 8181 8080")
         sys.exit(1)
 
     # --- SSL Context Setup ---
@@ -251,9 +300,9 @@ async def main():
     try:
         import cryptography
     except ImportError:
-        logger.critical("❌ Python 'cryptography' library not found!")
-        logger.critical("   This library is essential for secure WebSocket (WSS) connections.")
-        logger.critical("   Please install it: pip3 install cryptography")
+        logger.critical("❌ Python 'cryptography' bibliotek ikke fundet!")
+        logger.critical("   Dette bibliotek er essentielt for sikre WebSocket (WSS) forbindelser.")
+        logger.critical("   Installer det venligst: pip3 install cryptography")
         sys.exit(1)
 
     home_dir = os.path.expanduser("~")
@@ -265,18 +314,17 @@ async def main():
     try:
         ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
         ssl_context.load_cert_chain(CERT_FILE, KEY_FILE)
-        logger.info(f"✅ SSL certificates loaded: {CERT_FILE}, {KEY_FILE}")
+        logger.info(f"✅ SSL certifikater indlæst: {CERT_FILE}, {KEY_FILE}")
     except FileNotFoundError:
-        logger.critical("❌ ERROR: SSL certificate or key files not found.")
-        logger.critical(f"         Make sure '{CERT_FILE}' and '{KEY_FILE}' exist.")
-        logger.critical("         The PWA will NOT be able to connect via HTTPS/WSS without these files.")
-        logger.critical("         If you don't have them, you can generate self-signed certs.")
-        sys.exit(1) # Exit if SSL files are missing, as WSS is critical
+        logger.critical("❌ FEJL: SSL certifikat- eller nøglefiler ikke fundet.")
+        logger.critical(f"         Sørg for, at '{CERT_FILE}' og '{KEY_FILE}' eksisterer.")
+        logger.critical("         PWA'en vil IKKE kunne forbinde via HTTPS/WSS uden disse filer.")
+        sys.exit(1) # Afslut, hvis SSL-filer mangler, da WSS er kritisk
     except Exception as e:
-        logger.critical(f"❌ ERROR: Could not load SSL certificates: {e}")
-        logger.critical("         The PWA will NOT be able to connect via HTTPS/WSS.")
-        logger.critical("         Check file permissions or certificate format.")
-        sys.exit(1) # Exit on other SSL errors
+        logger.critical(f"❌ FEJL: Kunne ikke indlæse SSL certifikater: {e}")
+        logger.critical("         PWA'en vil IKKE kunne forbinde via HTTPS/WSS.")
+        logger.critical("         Kontroller filtilladelser eller certifikatformat.")
+        sys.exit(1) # Afslut på andre SSL-fejl
 
     app = web.Application()
     app.router.add_get("/ws", websocket_handler)
@@ -304,7 +352,7 @@ async def main():
     except asyncio.CancelledError:
         pass 
     finally:
-        logger.info("Server shutting down. Stopping FFmpeg...")
+        logger.info("Server lukker ned. Stopper FFmpeg...")
         await stop_ffmpeg_process() 
         await runner.cleanup() 
 
@@ -317,13 +365,13 @@ if __name__ == "__main__":
     try:
         import aiohttp
     except ImportError:
-        logger.critical("❌ Missing required Python library: 'aiohttp'")
-        logger.critical("   Please install it using pip3: pip3 install aiohttp")
+        logger.critical("❌ Mangler påkrævet Python bibliotek: 'aiohttp'")
+        logger.critical("   Installer det venligst med pip3: pip3 install aiohttp")
         sys.exit(1)
     
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("\nServer stopped by user (Ctrl+C).")
+        logger.info("\nServer stoppet af bruger (Ctrl+C).")
     except Exception as e:
-        logger.critical(f"An unexpected error occurred during server execution: {e}", exc_info=True)
+        logger.critical(f"En uventet fejl opstod under serverudførelse: {e}", exc_info=True)
