@@ -26,18 +26,84 @@ import logging
 import json # Nyt import for JSON-parsing
 
 # Required libraries for aiohttp web server and websockets
-from aiohttp import web, ClientSession 
+from aiohttp import web, ClientSession
 
-# --- Logging Setup ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s',
-                    datefmt='%Y-%m-%d %H:%M:%S') # Add timestamp to logs
+# --- Global Logger Initialization ---
+# Initialize logger here. Its configuration will be fully set up by setup_logging()
 logger = logging.getLogger(__name__)
-# TEMPORARY: Set logger level to DEBUG to see verbose FFmpeg output
-logger.setLevel(logging.DEBUG) # <--- VIGTIG ÆNDRING TIL FEJLFINDING
+
+# --- Configuration Loading ---
+CONFIG_FILE = 'mediaserver.json'
+config = {} # Global dictionary to hold configurations
+
+def load_config():
+    global config
+    try:
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.load(f)
+        # Using print here as the full logging setup might not be complete yet.
+        # Once setup_logging runs, messages will go to the file.
+        print(f"✅ Loaded configuration from '{CONFIG_FILE}'")
+    except FileNotFoundError:
+        print(f"⚠️ Configuration file '{CONFIG_FILE}' not found. Using default settings.", file=sys.stderr)
+    except json.JSONDecodeError as e:
+        print(f"❌ Error decoding JSON from '{CONFIG_FILE}': {e}. Using default settings.", file=sys.stderr)
+    except Exception as e:
+        print(f"❌ Unexpected error loading config: {e}. Using default settings.", file=sys.stderr)
+
+def setup_logging():
+    """
+    Sets up the logging configuration based on settings from the loaded config.
+    Configures both console and file handlers.
+    """
+    # Remove any existing handlers from previous basicConfig calls or prior setups
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+    for handler in logging.root.handlers[:]:
+        logging.root.removeHandler(handler)
+
+    log_file_path = config.get("log_file_path", None)
+    log_level_str = config.get("log_level", "INFO").upper() # Default to INFO if not in config
+
+    # Convert string log level to logging module's level object
+    log_level = getattr(logging, log_level_str, logging.INFO)
+
+    # Set the root logger's level to ensure messages pass to handlers
+    logging.root.setLevel(log_level)
+
+    # Configure formatter
+    formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
+
+    # Console handler
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    console_handler.setLevel(log_level) # Set level for this specific handler
+    logger.addHandler(console_handler)
+
+    # File handler (if path is provided)
+    if log_file_path:
+        try:
+            # Ensure the directory for the log file exists
+            log_dir = os.path.dirname(log_file_path)
+            if log_dir and not os.path.exists(log_dir):
+                os.makedirs(log_dir, exist_ok=True)
+
+            file_handler = logging.FileHandler(log_file_path)
+            file_handler.setFormatter(formatter)
+            file_handler.setLevel(log_level) # Set level for this specific handler
+            logger.addHandler(file_handler)
+            logger.info(f"Logging to file: {log_file_path}")
+        except Exception as e:
+            logger.error(f"Failed to set up file logging to {log_file_path}: {e}")
+            logger.warning("Logging will proceed only to console.")
+
+    # Set the overall logger level for this specific logger instance
+    logger.setLevel(log_level)
+    logger.info(f"Logger level set to: {log_level_str}")
 
 # --- Global variables for video data and synchronization ---
 latest_video_chunk = None
-new_chunk_event = asyncio.Event() 
+new_chunk_event = asyncio.Event()
 ffmpeg_process = None
 client_video_mime_type = None # Global variabel til at gemme klientens MIME type
 
@@ -52,6 +118,9 @@ RTSP_OUTPUT_URL = "rtsp://127.0.0.1:8554/live" # EXAMPLE: Adjust if Motion creat
 # OR for RTMP: RTMP_OUTPUT_URL = "rtmp://127.0.0.1/live/motionstream" # EXAMPLE: Adjust if Motion accepts RTMP push
 
 # --- Load placeholder video at startup ---
+# This block now relies on the logger being fully configured, which happens in main().
+# If you need this logged to file, ensure load_config and setup_logging are called before this.
+# For now, it will use the console if called before setup_logging.
 try:
     if os.path.exists(PLACEHOLDER_WEBM_PATH):
         with open(PLACEHOLDER_WEBM_PATH, 'rb') as f:
@@ -108,19 +177,19 @@ async def start_ffmpeg_process(output_url):
     # Check if ffmpeg executable is available
     if not subprocess.run(['which', 'ffmpeg'], capture_output=True).returncode == 0:
         logger.error("❌ FFmpeg executable not found in system PATH!")
-        logger.error("   Please install FFmpeg on your server. Here are common methods:")
-        logger.error("   - Debian/Ubuntu: sudo apt-get update && sudo apt-get install ffmpeg")
-        logger.error("   - Fedora: sudo dnf install ffmpeg")
-        logger.error("   - CentOS/RHEL: sudo yum install epel-release && sudo yum install ffmpeg")
-        logger.error("   - macOS (Homebrew): brew install ffmpeg")
-        logger.error("   - Windows: Download from https://ffmpeg.org/download.html and add to PATH.")
+        logger.error("    Please install FFmpeg on your server. Here are common methods:")
+        logger.error("    - Debian/Ubuntu: sudo apt-get update && sudo apt-get install ffmpeg")
+        logger.error("    - Fedora: sudo dnf install ffmpeg")
+        logger.error("    - CentOS/RHEL: sudo yum install epel-release && sudo yum install ffmpeg")
+        logger.error("    - macOS (Homebrew): brew install ffmpeg")
+        logger.error("    - Windows: Download from https://ffmpeg.org/download.html and add to PATH.")
         return # Do not proceed if FFmpeg is not found
 
     ffmpeg_cmd = [
         'ffmpeg',
         '-loglevel', 'debug', # <--- VIGTIG ÆNDRING TIL FEJLFINDING: Fra 'warning' til 'debug'
         '-f', ffmpeg_input_format, # Explicitly specify input format
-        '-i', 'pipe:0',          # Read input from stdin
+        '-i', 'pipe:0',            # Read input from stdin
         # Tilføj -probesize og -analyzeduration for at hjælpe FFmpeg med korrekt at detektere stream-egenskaber
         # Dette kan være nyttigt, hvis FFmpeg har svært ved at forstå input-streamen i starten.
         '-probesize', '32',
@@ -128,9 +197,9 @@ async def start_ffmpeg_process(output_url):
         '-c:v', 'libx264',
         '-preset', 'veryfast',
         '-tune', 'zerolatency',
-        '-b:v', '2M',            # Adjust bitrate as needed (e.g., '1M', '3M')
-        '-g', '30',              # Keyframe interval (important for stream recovery)
-        '-f', 'rtsp',            # Output as RTSP stream
+        '-b:v', '2M',              # Adjust bitrate as needed (e.g., '1M', '3M')
+        '-g', '30',                # Keyframe interval (important for stream recovery)
+        '-f', 'rtsp',              # Output as RTSP stream
         '-rtsp_transport', 'tcp', # Ensure TCP transport for RTSP
         output_url
     ]
@@ -163,7 +232,7 @@ async def read_ffmpeg_stderr():
             if not line:
                 break
             # Logger nu alle linjer, da loggeren er sat til DEBUG niveau
-            logger.debug(f"FFmpeg STDERR: {line.decode().strip()}") 
+            logger.debug(f"FFmpeg STDERR: {line.decode().strip()}")
     logger.info("FFmpeg stderr reader stopped.")
 
 async def stop_ffmpeg_process():
@@ -185,7 +254,7 @@ async def websocket_handler(request):
     Handles incoming WebSocket connections from the camera (PWA).
     Receives WebM/MP4 video chunks and feeds them to the FFmpeg process's stdin.
     """
-    global latest_video_chunk 
+    global latest_video_chunk
     global new_chunk_event
     global ffmpeg_process
     global client_video_mime_type # Brug denne globale variabel
@@ -206,16 +275,16 @@ async def websocket_handler(request):
                     break # Afslut denne loop, vi fik init beskeden
             except json.JSONDecodeError:
                 logger.warning(f"Received non-JSON text message: {msg.data}. Expected init message.")
-                await ws.close(code=1003) 
+                await ws.close(code=1003)
                 return ws
         else:
             logger.warning(f"Received non-text initial message type: {msg.type}. Expected JSON MIME type.")
-            await ws.close(code=1003) 
+            await ws.close(code=1003)
             return ws
 
     if not client_video_mime_type:
         logger.error("Klient sendte ikke forventet MIME type. Lukker forbindelse.")
-        await ws.close(code=1003) 
+        await ws.close(code=1003)
         return ws
 
     # Sørg for, at FFmpeg kører, når den første klient forbinder OG vi har mime-typen
@@ -225,7 +294,7 @@ async def websocket_handler(request):
 
     if not ffmpeg_process:
         logger.error("FFmpeg processen kører ikke. Kan ikke modtage video data.")
-        await ws.close(code=1011) 
+        await ws.close(code=1011)
         return ws
 
     try:
@@ -240,11 +309,11 @@ async def websocket_handler(request):
                         new_chunk_event.set()
                     except BrokenPipeError:
                         logger.error("FFmpeg stdin pipe er brudt. FFmpeg er sandsynligvis styrtet ned eller afsluttet.")
-                        await ws.close(code=1011) 
+                        await ws.close(code=1011)
                         break
                     except Exception as e:
                         logger.error(f"Fejl ved skrivning til FFmpeg stdin: {e}")
-                        await ws.close(code=1011) 
+                        await ws.close(code=1011)
                         break
                 else:
                     logger.warning("Modtog video chunk, men FFmpeg stdin er ikke tilgængelig eller lukker. Dropper frame.")
@@ -304,8 +373,8 @@ async def main():
         import cryptography
     except ImportError:
         logger.critical("❌ Python 'cryptography' bibliotek ikke fundet!")
-        logger.critical("   Dette bibliotek er essentielt for sikre WebSocket (WSS) forbindelser.")
-        logger.critical("   Installer det venligst: pip3 install cryptography")
+        logger.critical("    Dette bibliotek er essentielt for sikre WebSocket (WSS) forbindelser.")
+        logger.critical("    Installer det venligst: pip3 install cryptography")
         sys.exit(1)
 
     home_dir = os.path.expanduser("~")
@@ -320,26 +389,26 @@ async def main():
         logger.info(f"✅ SSL certifikater indlæst: {CERT_FILE}, {KEY_FILE}")
     except FileNotFoundError:
         logger.critical("❌ FEJL: SSL certifikat- eller nøglefiler ikke fundet.")
-        logger.critical(f"         Sørg for, at '{CERT_FILE}' og '{KEY_FILE}' eksisterer.")
-        logger.critical("         PWA'en vil IKKE kunne forbinde via HTTPS/WSS uden disse filer.")
+        logger.critical(f"          Sørg for, at '{CERT_FILE}' og '{KEY_FILE}' eksisterer.")
+        logger.critical("          PWA'en vil IKKE kunne forbinde via HTTPS/WSS uden disse filer.")
         sys.exit(1) # Afslut, hvis SSL-filer mangler, da WSS er kritisk
     except Exception as e:
         logger.critical(f"❌ FEJL: Kunne ikke indlæse SSL certifikater: {e}")
-        logger.critical("         PWA'en vil IKKE kunne forbinde via HTTPS/WSS.")
-        logger.critical("         Kontroller filtilladelser eller certifikatformat.")
+        logger.critical("          PWA'en vil IKKE kunne forbinde via HTTPS/WSS.")
+        logger.critical("          Kontroller filtilladelser eller certifikatformat.")
         sys.exit(1) # Afslut på andre SSL-fejl
 
     app = web.Application()
     app.router.add_get("/ws", websocket_handler)
     app.router.add_get("/", websocket_handler) # Fallback for clients connecting to root path
 
-    app.router.add_get("/stream", mjpeg_stream_handler) 
+    app.router.add_get("/stream", mjpeg_stream_handler)
     
     runner = web.AppRunner(app)
     await runner.setup()
 
     ws_site = web.TCPSite(runner, '0.0.0.0', ws_port, ssl_context=ssl_context)
-    http_site = web.TCPSite(runner, '0.0.0.0', http_port) 
+    http_site = web.TCPSite(runner, '0.0.0.0', http_port)
 
     # --- Print Server Status ---
     logger.info(f"✅ WebSocket server listening on: wss://{get_local_ip()}:{ws_port}/ws (for camera PWA)")
@@ -347,27 +416,32 @@ async def main():
     logger.info(f"⚠️ Old MJPEG stream endpoint (http://{get_local_ip()}:{http_port}/stream) is now deprecated/removed and returns 404.")
 
     await ws_site.start()
-    await http_site.start() 
+    await http_site.start()
 
     try:
         while True:
-            await asyncio.sleep(3600) 
+            await asyncio.sleep(3600)
     except asyncio.CancelledError:
-        pass 
+        pass
     finally:
         logger.info("Server lukker ned. Stopper FFmpeg...")
-        await stop_ffmpeg_process() 
-        await runner.cleanup() 
+        await stop_ffmpeg_process()
+        await runner.cleanup()
 
 # --- Program entry point ---
 if __name__ == "__main__":
+    # Load configuration and setup logging immediately
+    load_config()
+    setup_logging()
+
     # --- Check for non-standard library dependencies (aiohttp) ---
-    # This check needs to happen BEFORE aiohttp is actually used, 
+    # This check needs to happen BEFORE aiohttp is actually used,
     # but after the 'web' import has been done for module-level usage.
     # The actual import for usage is at the top. This is just for error messaging.
     try:
         import aiohttp
     except ImportError:
+        # Now that logging is set up, we can use logger.critical
         logger.critical("❌ Mangler påkrævet Python bibliotek: 'aiohttp'")
         logger.critical("   Installer det venligst med pip3: pip3 install aiohttp")
         sys.exit(1)
