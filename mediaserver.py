@@ -167,6 +167,11 @@ async def start_ffmpeg_process(output_url):
             ffmpeg_input_format = 'mp4'
         elif 'webm' in client_video_mime_type:
             ffmpeg_input_format = 'webm'
+        # For Android's raw H.264 output, ensure 'h264' is the format,
+        # or it's implicitly handled by the lack of mp4/webm.
+        # If your Android app specifically sends 'video/h264' for raw streams:
+        elif 'video/h264' in client_video_mime_type:
+            ffmpeg_input_format = 'h264' # Explicitly handle raw H.264
         else:
             logger.error(f"❌ Ukendt eller ikke-understøttet klient MIME type: {client_video_mime_type}. Kan ikke starte FFmpeg.")
             return # Kan ikke starte FFmpeg uden at kende inputformatet
@@ -189,17 +194,23 @@ async def start_ffmpeg_process(output_url):
         'ffmpeg',
         '-loglevel', 'debug', # <--- VIGTIG ÆNDRING TIL FEJLFINDING: Fra 'warning' til 'debug'
         '-f', ffmpeg_input_format, # Explicitly specify input format
-        '-i', 'pipe:0',            # Read input from stdin
+        '-i', 'pipe:0',             # Read input from stdin
         # Tilføj -probesize og -analyzeduration for at hjælpe FFmpeg med korrekt at detektere stream-egenskaber
         # Dette kan være nyttigt, hvis FFmpeg har svært ved at forstå input-streamen i starten.
-        '-probesize', '32',
-        '-analyzeduration', '0',
+        '-probesize', '1000000',
+        '-analyzeduration', '1000000',
+        # --- START INDSÆTTELSE AF FLAG TIL ANDROID-KOMPATIBILITET ---
+        # Dette flag hjælper FFmpeg med at forstå fragmenterede MP4-streams,
+        # især dem der mangler et 'moov' atom i starten (som rå MediaCodec output).
+        # Det vil ikke påvirke WebM-streams og er sikkert for fulde fragmenterede MP4-streams.
+        '-movflags', '+empty_moov',
+        # --- SLUT INDSÆTTELSE AF FLAG ---
         '-c:v', 'libx264',
         '-preset', 'veryfast',
         '-tune', 'zerolatency',
-        '-b:v', '2M',              # Adjust bitrate as needed (e.g., '1M', '3M')
-        '-g', '30',                # Keyframe interval (important for stream recovery)
-        '-f', 'rtsp',              # Output as RTSP stream
+        '-b:v', '2M',             # Adjust bitrate as needed (e.g., '1M', '3M')
+        '-g', '30',              # Keyframe interval (important for stream recovery)
+        '-f', 'rtsp',            # Output as RTSP stream
         '-rtsp_transport', 'tcp', # Ensure TCP transport for RTSP
         output_url
     ]
@@ -261,7 +272,7 @@ async def websocket_handler(request):
 
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    logger.info("📡 Camera connected via WebSocket")
+    logger.info("📡 Camera connected via WebSocket.")
 
     # --- Trin 1: Modtag den indledende MIME type besked fra klienten ---
     # Denne loop er specifikt for den første besked, som skal være JSON
@@ -273,18 +284,28 @@ async def websocket_handler(request):
                     client_video_mime_type = data["mimeType"]
                     logger.info(f"Received client MIME type: {client_video_mime_type}")
                     break # Afslut denne loop, vi fik init beskeden
+                # If it's a log message, process it and continue
+                elif data.get("type") == "app_log":
+                    log_entry = data.get("log_entry")
+                    if log_entry:
+                        logger.info(f"APP_LOG from client: {log_entry}")
+                    # Continue waiting for init message
+                else:
+                    logger.warning(f"Received unexpected text message type in init phase: {data.get('type')}. Expected 'init'.")
+                    await ws.close(code=1003, message="Expected 'init' message with mimeType.")
+                    return ws
             except json.JSONDecodeError:
                 logger.warning(f"Received non-JSON text message: {msg.data}. Expected init message.")
-                await ws.close(code=1003)
+                await ws.close(code=1003, message="Invalid JSON format.")
                 return ws
         else:
             logger.warning(f"Received non-text initial message type: {msg.type}. Expected JSON MIME type.")
-            await ws.close(code=1003)
+            await ws.close(code=1003, message="Expected text message for init.")
             return ws
 
     if not client_video_mime_type:
         logger.error("Klient sendte ikke forventet MIME type. Lukker forbindelse.")
-        await ws.close(code=1003)
+        await ws.close(code=1003, message="MIME type not received.")
         return ws
 
     # Sørg for, at FFmpeg kører, når den første klient forbinder OG vi har mime-typen
@@ -294,7 +315,7 @@ async def websocket_handler(request):
 
     if not ffmpeg_process:
         logger.error("FFmpeg processen kører ikke. Kan ikke modtage video data.")
-        await ws.close(code=1011)
+        await ws.close(code=1011, message="FFmpeg process failed to start.")
         return ws
 
     try:
@@ -309,11 +330,11 @@ async def websocket_handler(request):
                         new_chunk_event.set()
                     except BrokenPipeError:
                         logger.error("FFmpeg stdin pipe er brudt. FFmpeg er sandsynligvis styrtet ned eller afsluttet.")
-                        await ws.close(code=1011)
+                        await ws.close(code=1011, message="FFmpeg pipe broken.")
                         break
                     except Exception as e:
                         logger.error(f"Fejl ved skrivning til FFmpeg stdin: {e}")
-                        await ws.close(code=1011)
+                        await ws.close(code=1011, message=f"Error writing to FFmpeg: {e}.")
                         break
                 else:
                     logger.warning("Modtog video chunk, men FFmpeg stdin er ikke tilgængelig eller lukker. Dropper frame.")
@@ -325,7 +346,17 @@ async def websocket_handler(request):
                 logger.info("WS forbindelse lukket af klient.")
                 break # Afslut loop, hvis klienten lukker forbindelse elegant
             elif msg.type == web.WSMsgType.TEXT: # Håndter uventede tekstbeskeder efter init
-                logger.warning(f"Modtog uventet tekstbesked efter init: {msg.data}")
+                try:
+                    message_data = json.loads(msg.data)
+                    if message_data.get("type") == "app_log":
+                        log_entry = message_data.get("log_entry")
+                        if log_entry:
+                            logger.info(f"APP_LOG from client: {log_entry}")
+                    else:
+                        logger.warning(f"Modtog uventet tekstbesked efter init: {msg.data}")
+                except json.JSONDecodeError:
+                    logger.warning(f"Received unexpected non-JSON text message after init: {msg.data}")
+
 
     except asyncio.CancelledError:
         logger.info("WebSocket handler task annulleret.")
@@ -443,7 +474,7 @@ if __name__ == "__main__":
     except ImportError:
         # Now that logging is set up, we can use logger.critical
         logger.critical("❌ Mangler påkrævet Python bibliotek: 'aiohttp'")
-        logger.critical("   Installer det venligst med pip3: pip3 install aiohttp")
+        logger.critical("    Installer det venligst med pip3: pip3 install aiohttp")
         sys.exit(1)
     
     try:
