@@ -261,7 +261,7 @@ async def websocket_handler(request):
 
     ws = web.WebSocketResponse()
     await ws.prepare(request)
-    logger.info("📡 Camera (PWA) connected via WebSocket")
+    logger.info("📡 Camera connected via WebSocket")
 
     # --- Trin 1: Modtag den indledende MIME type besked fra klienten ---
     # Denne loop er specifikt for den første besked, som skal være JSON
@@ -332,7 +332,7 @@ async def websocket_handler(request):
     except Exception as e:
         logger.error(f"Uventet fejl i WebSocket handler: {e}")
     finally:
-        logger.info("🔌 Camera (PWA) disconnected")
+        logger.info("🔌 Camera disconnected")
         # Stop IKKE FFmpeg her, da andre klienter måske vil forbinde.
         # FFmpeg skal kun stoppe, når serveren lukker ned.
         await ws.close()
